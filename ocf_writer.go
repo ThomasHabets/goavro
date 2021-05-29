@@ -193,7 +193,7 @@ func (ocfw *OCFWriter) appendDataIntoBlock(data []interface{}) error {
 		// compress into new bytes buffer.
 		bb := bytes.NewBuffer(make([]byte, 0, len(block)))
 
-		cw, _ := flate.NewWriter(bb, flate.DefaultCompression)
+		cw, _ := flate.NewWriter(bb, flate.BestCompression)
 		// writing bytes to cw will compress bytes and send to bb.
 		if _, err := cw.Write(block); err != nil {
 			return err
