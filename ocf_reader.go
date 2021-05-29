@@ -30,6 +30,8 @@ type OCFReader struct {
 	ior                 io.Reader
 	readReady           bool  // true after Scan and before Read
 	remainingBlockItems int64 // count of encoded data items remaining in block buffer to be decoded
+
+	RawCompressed bool
 }
 
 // NewOCFReader initializes and returns a new structure used to read an Avro
@@ -58,6 +60,63 @@ func NewOCFReader(ior io.Reader) (*OCFReader, error) {
 		return nil, fmt.Errorf("cannot create OCFReader: %s", err)
 	}
 	return &OCFReader{header: header, ior: ior}, nil
+}
+
+func (ocfr *OCFReader) ReadBlock() ([]byte, error) {
+	return ocfr.block, nil
+}
+
+func decompressFlate(block []byte) ([]byte, error) {
+	rc := flate.NewReader(bytes.NewBuffer(block))
+	defer rc.Close()
+	raw, err := ioutil.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	if err := rc.Close(); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func decompressSnappy(block []byte) ([]byte, error) {
+	index := len(block) - 4 // last 4 bytes is crc32 of decoded block
+	if index <= 0 {
+		return nil, fmt.Errorf("cannot decompress snappy without CRC32 checksum: %d", len(block))
+	}
+
+	decoded, err := snappy.Decode(nil, block[:index])
+	if err != nil {
+		return nil, fmt.Errorf("cannot decompress: %s", err)
+	}
+	actualCRC := crc32.ChecksumIEEE(decoded)
+	expectedCRC := binary.BigEndian.Uint32(block[index : index+4])
+	if actualCRC != expectedCRC {
+		return nil, fmt.Errorf("snappy CRC32 checksum mismatch: %x != %x", actualCRC, expectedCRC)
+	}
+	return decoded, nil
+}
+
+func (ocfr *OCFReader) Decompress(block []byte) ([]interface{}, error) {
+	raw, err := map[compressionID]func([]byte) ([]byte, error){
+		compressionNull:    func(b []byte) ([]byte, error) { return b, nil },
+		compressionDeflate: decompressFlate,
+		compressionSnappy:  decompressSnappy,
+	}[ocfr.header.compressionID](block)
+	if err != nil {
+		return nil, err
+	}
+	var ret []interface{}
+	for len(raw) > 0 {
+		var err error
+		var datum interface{}
+		datum, raw, err = ocfr.header.codec.NativeFromBinary(raw)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, datum)
+	}
+	return ret, nil
 }
 
 //MetaData returns the file metadata map found within the OCF file
@@ -184,46 +243,48 @@ func (ocfr *OCFReader) Scan() bool {
 			return false
 		}
 
-		switch ocfr.header.compressionID {
-		case compressionNull:
-			// no-op
+		if !ocfr.RawCompressed {
+			switch ocfr.header.compressionID {
+			case compressionNull:
+				// no-op
 
-		case compressionDeflate:
-			// NOTE: flate.NewReader wraps with io.ByteReader if argument does
-			// not implement that interface.
-			rc := flate.NewReader(bytes.NewBuffer(ocfr.block))
-			ocfr.block, ocfr.rerr = ioutil.ReadAll(rc)
-			if ocfr.rerr != nil {
-				_ = rc.Close()
-				return false
-			}
-			if ocfr.rerr = rc.Close(); ocfr.rerr != nil {
-				return false
-			}
+			case compressionDeflate:
+				// NOTE: flate.NewReader wraps with io.ByteReader if argument does
+				// not implement that interface.
+				rc := flate.NewReader(bytes.NewBuffer(ocfr.block))
+				ocfr.block, ocfr.rerr = ioutil.ReadAll(rc)
+				if ocfr.rerr != nil {
+					_ = rc.Close()
+					return false
+				}
+				if ocfr.rerr = rc.Close(); ocfr.rerr != nil {
+					return false
+				}
 
-		case compressionSnappy:
-			index := len(ocfr.block) - 4 // last 4 bytes is crc32 of decoded block
-			if index <= 0 {
-				ocfr.rerr = fmt.Errorf("cannot decompress snappy without CRC32 checksum: %d", len(ocfr.block))
-				return false
-			}
-			decoded, err := snappy.Decode(nil, ocfr.block[:index])
-			if err != nil {
-				ocfr.rerr = fmt.Errorf("cannot decompress: %s", err)
-				return false
-			}
-			actualCRC := crc32.ChecksumIEEE(decoded)
-			expectedCRC := binary.BigEndian.Uint32(ocfr.block[index : index+4])
-			if actualCRC != expectedCRC {
-				ocfr.rerr = fmt.Errorf("snappy CRC32 checksum mismatch: %x != %x", actualCRC, expectedCRC)
-				return false
-			}
-			ocfr.block = decoded
+			case compressionSnappy:
+				index := len(ocfr.block) - 4 // last 4 bytes is crc32 of decoded block
+				if index <= 0 {
+					ocfr.rerr = fmt.Errorf("cannot decompress snappy without CRC32 checksum: %d", len(ocfr.block))
+					return false
+				}
+				decoded, err := snappy.Decode(nil, ocfr.block[:index])
+				if err != nil {
+					ocfr.rerr = fmt.Errorf("cannot decompress: %s", err)
+					return false
+				}
+				actualCRC := crc32.ChecksumIEEE(decoded)
+				expectedCRC := binary.BigEndian.Uint32(ocfr.block[index : index+4])
+				if actualCRC != expectedCRC {
+					ocfr.rerr = fmt.Errorf("snappy CRC32 checksum mismatch: %x != %x", actualCRC, expectedCRC)
+					return false
+				}
+				ocfr.block = decoded
 
-		default:
-			ocfr.rerr = fmt.Errorf("should not get here: cannot compress block using unrecognized compression: %d", ocfr.header.compressionID)
-			return false
+			default:
+				ocfr.rerr = fmt.Errorf("should not get here: cannot compress block using unrecognized compression: %d", ocfr.header.compressionID)
+				return false
 
+			}
 		}
 
 		// read and ensure sync marker matches
