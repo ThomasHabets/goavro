@@ -307,10 +307,8 @@ func (ocfr *OCFReader) Scan() bool {
 				ocfr.rerr = fmt.Errorf("zstd error: %s", err)
 				return false
 			}
-			ocfr.block, ocfr.rerr = ioutil.ReadAll(rc)
-			if cerr := rc.Close(); ocfr.rerr == nil {
-			    ocfr.rerr = cerr
-			}
+				ocfr.block, ocfr.rerr = ioutil.ReadAll(rc)
+				rc.Close();
 			if ocfr.rerr != nil {
 				return false
 			}
