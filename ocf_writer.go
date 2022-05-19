@@ -227,7 +227,10 @@ func (ocfw *OCFWriter) appendDataIntoBlock(data []interface{}) error {
 
 	case compressionZstd:
 		bb := bytes.NewBuffer(make([]byte, 0, len(block)))
-		cw, _ := zstd.NewWriter(bb)
+		cw, err := zstd.NewWriter(bb, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+		if err != nil {
+			return err
+		}
 		if _, err := cw.Write(block); err != nil {
 			return err
 		}
